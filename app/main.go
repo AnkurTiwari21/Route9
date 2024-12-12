@@ -8,7 +8,10 @@ import (
 	"net"
 	"os"
 	"time"
+
 	"github.com/AnkurTiwari21/app/models"
+	"github.com/go-redis/redis/v8"
+	"github.com/joho/godotenv"
 	"github.com/sirupsen/logrus"
 )
 
@@ -16,7 +19,7 @@ import (
 var _ = net.ListenUDP
 
 func main() {
-	
+
 	//setting up a custom resolver
 	resolver := &net.Resolver{
 		PreferGo: true,
@@ -41,6 +44,16 @@ func main() {
 	}
 	defer udpConn.Close()
 
+	//after succesfull setup make a redis connection
+	err = godotenv.Load(".env")
+	if err != nil {
+		logrus.Error("Error loading .env file")
+		return
+	}
+	addr := os.Getenv("REDIS_ADDRESS")
+	pass := os.Getenv("REDIS_PASSWORD")
+	redisClient := models.InitRedisClient(addr, pass)
+
 	route9 := `
 	
 ██████╗░░█████╗░██╗░░░██╗████████╗███████╗░█████╗░
@@ -50,7 +63,6 @@ func main() {
 ██║░░██║╚█████╔╝╚██████╔╝░░░██║░░░███████╗░█████╔╝
 ╚═╝░░╚═╝░╚════╝░░╚═════╝░░░░╚═╝░░░╚══════╝░╚════╝░
 	`
-
 
 	fmt.Println(route9)
 	logrus.Infoln("Logs from your program will appear here!")
@@ -95,15 +107,34 @@ func main() {
 			finalQueryToSendToResolver := headerForResolver
 			finalQueryToSendToResolver = append(finalQueryToSendToResolver, intermediateQuestionBytes...)
 
-			ips, err := resolver.LookupIP(context.Background(), "ip4", string(domainNameBytes))
-			if err != nil {
-				logrus.Error("error in ip lookup | err ", err)
-				return
+			//before doing lookup first query the cache to see if the record is present
+			ip := ""
+
+			cachedIp, err := redisClient.Get(context.Background(), string(domainNameBytes)).Result()
+			if err != nil && err != redis.Nil {
+				logrus.Error("error getting data from redis | err ", err)
 			}
-			logrus.Infof("domain %s : %+v \n", string(domainNameBytes), ips)
+			ip = cachedIp //set ip to the cached ip
+
+			if cachedIp != "" {
+				//update the ttl for this key value pair in redis
+				redisClient.Set(context.Background(), string(domainNameBytes), cachedIp, time.Second*60)
+			}
+
+			if err == redis.Nil {
+				ips, err := resolver.LookupIP(context.Background(), "ip4", string(domainNameBytes))
+				if err != nil {
+					logrus.Error("error in ip lookup | err ", err)
+					return
+				}
+				ip = ips[0].To4().String()
+				redisClient.Set(context.Background(), string(domainNameBytes), ip, time.Second*60)
+			}
+
+			logrus.Infof("domain %s : %+v \n", string(domainNameBytes), ip)
 
 			domain = append(domain, string(domainNameBytes))
-			answerBytes = append(answerBytes, response.Answer.FillAnswerAndReturnBytes(string(domainNameBytes), 1, 1, 60, 4, ips[0].To4().String())...)
+			answerBytes = append(answerBytes, response.Answer.FillAnswerAndReturnBytes(string(domainNameBytes), 1, 1, 60, 4, ip)...)
 
 			initialPos = int(pos)
 			initialPos += 4
